@@ -226,7 +226,7 @@ class ConfluenceStrategy:
 
 def position_size(equity: float, risk_pct: float, entry: float, stop_loss: float) -> int:
     risk_amount = equity * (risk_pct / 100)
-    per_share_risk = math.abs(entry - stop_loss)
+    per_share_risk = abs(entry - stop_loss)
     if per_share_risk <= 0:
         return 0
     return int(risk_amount / per_share_risk)
@@ -312,8 +312,9 @@ def run(force_live: bool = False):
             for trade in active_dry_run_trades:
                 # Retrieve current price for the token
                 try:
-                    now = datetime.now()
-                    candles = client.get_candles(trade["token"], "NSE", "THREE_MINUTE", now - timedelta(minutes=15), now)
+                    # Convert UTC to IST for historical queries
+                    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+                    candles = client.get_candles(trade["token"], "NSE", "THREE_MINUTE", now_ist - timedelta(minutes=15), now_ist)
                     if not candles.empty:
                         current_price = candles.iloc[-1]["close"]
                         
@@ -357,15 +358,18 @@ def run(force_live: bool = False):
                 continue
 
             try:
-                now = datetime.now()
+                # Convert UTC to IST for historical queries (ensures Render's timezone matches Indian market time)
+                now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
                 
-                # Sleep 0.5s before ltf call to stay safely below 3 requests/sec rate limit
-                time.sleep(0.5)
-                ltf_df = client.get_candles(token, "NSE", trading_cfg["ltf"], now - timedelta(hours=8), now)
+                # Sleep 1.0s before ltf call to stay strictly below 3 requests/sec rate limit
+                time.sleep(1.0)
+                # Fetch last 24 hours of 3m data (ensures we get 120+ candles even right at market open)
+                ltf_df = client.get_candles(token, "NSE", trading_cfg["ltf"], now_ist - timedelta(hours=24), now_ist)
                 
-                # Sleep 0.5s before htf call
-                time.sleep(0.5)
-                htf_df = client.get_candles(token, "NSE", trading_cfg["htf"], now - timedelta(days=3), now)
+                # Sleep 1.0s before htf call
+                time.sleep(1.0)
+                # Fetch last 10 days of 15m data (covers previous 5-6 trading days)
+                htf_df = client.get_candles(token, "NSE", trading_cfg["htf"], now_ist - timedelta(days=10), now_ist)
 
                 # Validate data exists and contains enough rows for calculations (WMA 50 needs at least 50+ rows)
                 if ltf_df.empty or htf_df.empty or len(ltf_df) < 55 or len(htf_df) < 55:
@@ -415,4 +419,3 @@ if __name__ == "__main__":
     parser.add_argument("--live", action="store_true", help="Force live trading, overriding dry_run in config")
     args = parser.parse_args()
     run(force_live=args.live)
-import math # import here to support position_size
