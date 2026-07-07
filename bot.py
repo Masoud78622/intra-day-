@@ -117,8 +117,15 @@ class AngelOneClient:
         }
         resp = self.smart.getCandleData(params)
         if not resp.get("status"):
-            raise RuntimeError(f"Candle fetch failed: {resp}")
+            raise RuntimeError(f"Candle fetch failed: {resp.get('message', resp)}")
+        
+        if resp.get("data") is None:
+            return pd.DataFrame()
+            
         df = pd.DataFrame(resp["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+        if df.empty:
+            return df
+            
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         # Ensure values are float
         for col in ["open", "high", "low", "close"]:
@@ -219,7 +226,7 @@ class ConfluenceStrategy:
 
 def position_size(equity: float, risk_pct: float, entry: float, stop_loss: float) -> int:
     risk_amount = equity * (risk_pct / 100)
-    per_share_risk = abs(entry - stop_loss)
+    per_share_risk = math.abs(entry - stop_loss)
     if per_share_risk <= 0:
         return 0
     return int(risk_amount / per_share_risk)
@@ -307,28 +314,31 @@ def run(force_live: bool = False):
                 try:
                     now = datetime.now()
                     candles = client.get_candles(trade["token"], "NSE", "THREE_MINUTE", now - timedelta(minutes=15), now)
-                    current_price = candles.iloc[-1]["close"]
-                    
-                    exited = False
-                    pnl = 0.0
-                    if trade["side"] == "BUY":
-                        if current_price <= trade["sl"]:
-                            exited = True
-                            pnl = (trade["sl"] - trade["entry"]) * trade["qty"]
-                        elif current_price >= trade["tp"]:
-                            exited = True
-                            pnl = (trade["tp"] - trade["entry"]) * trade["qty"]
-                    else:
-                        if current_price >= trade["sl"]:
-                            exited = True
-                            pnl = (trade["entry"] - trade["sl"]) * trade["qty"]
-                        elif current_price <= trade["tp"]:
-                            exited = True
-                            pnl = (trade["entry"] - trade["tp"]) * trade["qty"]
-                            
-                    if exited:
-                        daily_pnl += pnl
-                        log.info("[DRY-RUN EXIT] %s PnL: %.2f (Total Daily PnL: %.2f)", trade["symbol"], pnl, daily_pnl)
+                    if not candles.empty:
+                        current_price = candles.iloc[-1]["close"]
+                        
+                        exited = False
+                        pnl = 0.0
+                        if trade["side"] == "BUY":
+                            if current_price <= trade["sl"]:
+                                exited = True
+                                pnl = (trade["sl"] - trade["entry"]) * trade["qty"]
+                            elif current_price >= trade["tp"]:
+                                exited = True
+                                pnl = (trade["tp"] - trade["entry"]) * trade["qty"]
+                        else:
+                            if current_price >= trade["sl"]:
+                                exited = True
+                                pnl = (trade["entry"] - trade["sl"]) * trade["qty"]
+                            elif current_price <= trade["tp"]:
+                                exited = True
+                                pnl = (trade["entry"] - trade["tp"]) * trade["qty"]
+                                
+                        if exited:
+                            daily_pnl += pnl
+                            log.info("[DRY-RUN EXIT] %s PnL: %.2f (Total Daily PnL: %.2f)", trade["symbol"], pnl, daily_pnl)
+                        else:
+                            still_active.append(trade)
                     else:
                         still_active.append(trade)
                 except Exception as e:
@@ -348,9 +358,20 @@ def run(force_live: bool = False):
 
             try:
                 now = datetime.now()
-                # Get historical data for LTF (3m) and HTF (15m)
+                
+                # Sleep 0.5s before ltf call to stay safely below 3 requests/sec rate limit
+                time.sleep(0.5)
                 ltf_df = client.get_candles(token, "NSE", trading_cfg["ltf"], now - timedelta(hours=8), now)
+                
+                # Sleep 0.5s before htf call
+                time.sleep(0.5)
                 htf_df = client.get_candles(token, "NSE", trading_cfg["htf"], now - timedelta(days=3), now)
+
+                # Validate data exists and contains enough rows for calculations (WMA 50 needs at least 50+ rows)
+                if ltf_df.empty or htf_df.empty or len(ltf_df) < 55 or len(htf_df) < 55:
+                    log.warning("%s: Not enough candles found (LTF: %d/55, HTF: %d/55). Skipping.", 
+                                symbol, len(ltf_df), len(htf_df))
+                    continue
 
                 result = strategy.check_confluence(ltf_df, htf_df)
                 if not result["signal"]:
@@ -394,3 +415,4 @@ if __name__ == "__main__":
     parser.add_argument("--live", action="store_true", help="Force live trading, overriding dry_run in config")
     args = parser.parse_args()
     run(force_live=args.live)
+import math # import here to support position_size
