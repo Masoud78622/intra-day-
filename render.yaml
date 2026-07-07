@@ -1,0 +1,16 @@
+services:
+  - type: worker
+    name: angel-one-algo-bot
+    env: docker
+    dockerfilePath: Dockerfile
+    dockerContext: .
+    plan: free
+    envVars:
+      - key: ANGEL_CLIENT_ID
+        sync: false
+      - key: ANGEL_PASSWORD
+        sync: false
+      - key: ANGEL_API_KEY
+        sync: false
+      - key: ANGEL_TOTP_SECRET
+        sync: false
