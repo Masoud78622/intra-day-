@@ -14,7 +14,9 @@ import time
 import argparse
 import logging
 import os
+import threading
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pandas as pd
 import pyotp
@@ -28,6 +30,26 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("algobot")
+
+
+# ────────────────────────────────────────────────────────
+# Health Check Server (Enables Render 100% Free Web Service)
+# ────────────────────────────────────────────────────────
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK - Bot is active and running.")
+        
+    def log_message(self, format, *args):
+        return  # Suppress connection logging to keep logs clean
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 8000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    log.info("Starting background health check server on port %d", port)
+    server.serve_forever()
 
 
 class AngelOneClient:
@@ -237,6 +259,9 @@ def load_config(path: str = "config.json") -> dict:
 
 
 def run(force_live: bool = False):
+    # Start the local health web server in a daemon thread
+    threading.Thread(target=start_health_server, daemon=True).start()
+
     cfg = load_config()
     trading_cfg = cfg["trading"]
     dry_run = trading_cfg["dry_run"] and not force_live
