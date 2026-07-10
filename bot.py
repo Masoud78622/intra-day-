@@ -9,6 +9,7 @@ import argparse
 import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -29,17 +30,46 @@ log = logging.getLogger("algobot")
 API_DELAY_SECONDS = 1.5
 # Max retries when rate limited
 MAX_RETRIES = 4
+# Per-API-call timeout (seconds). If getCandleData hangs longer than this, it is aborted.
+API_CALL_TIMEOUT = 30
+# If the main loop has not completed a cycle in this many seconds, health check → 503
+WATCHDOG_TIMEOUT = 600  # 10 minutes
+# Re-login every N hours to keep session alive (Angel One tokens expire ~24h)
+SESSION_RENEWAL_HOURS = 22
+
+
+# ────────────────────────────────────────────────────────
+# Watchdog: tracks the last time the main loop was alive
+# ────────────────────────────────────────────────────────
+_last_heartbeat: float = time.monotonic()
+
+
+def update_heartbeat():
+    global _last_heartbeat
+    _last_heartbeat = time.monotonic()
+
+
+def is_alive() -> bool:
+    return (time.monotonic() - _last_heartbeat) < WATCHDOG_TIMEOUT
 
 
 # ────────────────────────────────────────────────────────
 # Health Check Server (Enables Render Free Web Service)
+# Returns 503 if the main loop is frozen → triggers Render restart
 # ────────────────────────────────────────────────────────
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK - Bot is running.")
+        if is_alive():
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK - Bot is running.")
+        else:
+            self.send_response(503)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            elapsed = int(time.monotonic() - _last_heartbeat)
+            self.wfile.write(f"FROZEN - No heartbeat for {elapsed}s".encode())
 
     def log_message(self, format, *args):
         return
@@ -62,8 +92,10 @@ class AngelOneClient:
 
         self.smart = SmartConnect(api_key=self.api_key)
         self.session = None
+        self._last_login_time: datetime | None = None
+        self._login_lock = threading.Lock()
 
-    def login(self):
+    def login(self) -> bool:
         if self.client_id == "YOUR_CLIENT_ID":
             log.warning("Credentials not configured - running in DRY-RUN mode.")
             return False
@@ -73,11 +105,25 @@ class AngelOneClient:
             if not data.get("status"):
                 raise RuntimeError(f"Login failed: {data}")
             self.session = data
+            self._last_login_time = datetime.utcnow()
             log.info("Logged in to Angel One as %s", self.client_id)
             return True
         except Exception as e:
             log.error("Login failed: %s", str(e))
             return False
+
+    def renew_session_if_needed(self):
+        """Re-login if the session is older than SESSION_RENEWAL_HOURS."""
+        if not self.session or self._last_login_time is None:
+            return
+        age_hours = (datetime.utcnow() - self._last_login_time).total_seconds() / 3600
+        if age_hours >= SESSION_RENEWAL_HOURS:
+            log.info("Session is %.1fh old — renewing login...", age_hours)
+            with self._login_lock:
+                # Double-check after acquiring the lock
+                age_hours = (datetime.utcnow() - self._last_login_time).total_seconds() / 3600
+                if age_hours >= SESSION_RENEWAL_HOURS:
+                    self.login()
 
     def get_equity(self) -> float:
         if not self.session:
@@ -90,9 +136,15 @@ class AngelOneClient:
             log.warning("Could not read equity: %s", str(e))
         return 100000.0
 
+    def _fetch_candle_data(self, params: dict) -> dict:
+        """Runs getCandleData in a way that can be interrupted by a timeout."""
+        return self.smart.getCandleData(params)
+
     def get_candles_with_retry(self, symbol_token: str, exchange: str, interval: str,
                                 from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
-        """Fetch candles with exponential backoff retry on rate-limit errors."""
+        """Fetch candles with exponential backoff retry on rate-limit errors.
+        Each API call is wrapped in a timeout to prevent infinite hangs.
+        """
         if not self.session:
             # Mock data for dry-run
             freq = "3min" if "THREE" in interval else "15min"
@@ -116,13 +168,36 @@ class AngelOneClient:
             try:
                 # Mandatory delay before every API call
                 time.sleep(API_DELAY_SECONDS)
-                resp = self.smart.getCandleData(params)
+
+                # Run the API call in a thread with a hard timeout to prevent hangs
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(self._fetch_candle_data, params)
+                    try:
+                        resp = future.result(timeout=API_CALL_TIMEOUT)
+                    except FuturesTimeoutError:
+                        log.warning("getCandleData timed out after %ds for token %s (attempt %d/%d)",
+                                    API_CALL_TIMEOUT, symbol_token, attempt + 1, MAX_RETRIES)
+                        # Count as a rate-limit-style transient error and retry
+                        wait = (2 ** attempt) * 5
+                        time.sleep(wait)
+                        continue
 
                 if not resp.get("status"):
                     msg = str(resp.get("message", resp))
-                    if "exceeding access rate" in msg.lower() or "access denied" in msg.lower():
+                    msg_lower = msg.lower()
+                    _rate_limit_phrases = (
+                        "exceeding access rate", "access denied",
+                        "too many requests", "rate limit", "ab1021",
+                    )
+                    _auth_phrases = ("invalid token", "unauthorized")
+                    if any(p in msg_lower for p in _rate_limit_phrases + _auth_phrases):
                         wait = (2 ** attempt) * 5  # 5s, 10s, 20s, 40s
-                        log.warning("Rate limited. Waiting %ds before retry %d/%d...", wait, attempt + 1, MAX_RETRIES)
+                        log.warning("Rate limited / auth error. Waiting %ds before retry %d/%d... [%s]",
+                                    wait, attempt + 1, MAX_RETRIES, msg[:80])
+                        # If auth error, try re-logging in before next attempt
+                        if any(p in msg_lower for p in _auth_phrases):
+                            log.info("Auth error detected — attempting re-login...")
+                            self.login()
                         time.sleep(wait)
                         continue
                     raise RuntimeError(f"Candle fetch failed: {msg}")
@@ -140,8 +215,12 @@ class AngelOneClient:
             except RuntimeError:
                 raise
             except Exception as e:
-                err_msg = str(e)
-                if "exceeding access rate" in err_msg.lower() or "access denied" in err_msg.lower():
+                err_msg = str(e).lower()
+                _transient = (
+                    "exceeding access rate", "access denied",
+                    "too many requests", "rate limit", "ab1021",
+                )
+                if any(p in err_msg for p in _transient):
                     wait = (2 ** attempt) * 5
                     log.warning("Rate limited (exception). Waiting %ds before retry %d/%d...", wait, attempt + 1, MAX_RETRIES)
                     time.sleep(wait)
@@ -285,17 +364,32 @@ def run(force_live: bool = False):
     risk_per_trade_pct = trading_cfg["risk_per_trade_pct"]
     rr_ratio = trading_cfg["reward_risk_ratio"]
 
-    # Official NSE tokens (Shariah-compliant list)
+    # Official NSE tokens — verified against scrip_master.json (2026-07-10)
     symbol_tokens = {
-        "WIPRO": "3721", "COALINDIA": "20396", "PETRONET": "11359",
-        "RAILTEL": "12316", "BIOCON": "11373", "MOIL": "17937",
-        "DLINKINDIA": "16075", "JYOTHYLAB": "15012", "TCS": "11536", "INFY": "1594"
+        "WIPRO": "3787",    # was 3721 (wrong)
+        "COALINDIA": "20374",
+        "PETRONET": "11351",  # was 11359 (wrong)
+        "RAILTEL": "2431",   # was 12316 (wrong)
+        "BIOCON": "11373",
+        "MOIL": "20830",    # was 17937 (wrong)
+        "DLINKINDIA": "17851",  # was 16075 (wrong)
+        "JYOTHYLAB": "15146",   # was 15012 (wrong)
+        "TCS": "11536",
+        "INFY": "1594",
     }
+
+    # Stamp the initial heartbeat so watchdog doesn't fire before first cycle
+    update_heartbeat()
 
     while True:
         if daily_pnl <= -daily_max_loss:
             log.warning("Daily max loss limit hit (-%.2f). Halting for the session.", daily_max_loss)
             break
+
+        # ── Renew session proactively before it expires ──
+        client.renew_session_if_needed()
+
+        cycle_start = time.monotonic()
 
         for symbol in trading_cfg["stocks"]:
             token = symbol_tokens.get(symbol)
@@ -353,7 +447,12 @@ def run(force_live: bool = False):
             except Exception as e:
                 log.error("Error processing %s: %s", symbol, str(e))
 
-        log.info("Cycle complete. Sleeping 3 minutes...")
+        cycle_elapsed = time.monotonic() - cycle_start
+        log.info("Cycle complete in %.1fs. Sleeping 3 minutes...", cycle_elapsed)
+
+        # ── Update watchdog heartbeat AFTER a successful cycle ──
+        update_heartbeat()
+
         time.sleep(180)
 
 
